@@ -49,6 +49,63 @@ transforman geométricamente a 224×224. Para descargar un CSV oficial autorizad
 `--nodule-url URL`; se guarda como `nodules_official.csv`. Revise la licencia de
 JSRT y la edición de anotaciones antes de distribuir o publicar resultados.
 
+### Ejecución completa en Kaggle
+
+El cuaderno único [`kaggle_runner.ipynb`](kaggle_runner.ipynb) está preparado para
+**Run All**. Clona esta versión del repositorio, instala
+`requirements-kaggle.txt`, obtiene o reutiliza los dos inputs públicos, prepara las
+anotaciones, ejecuta el benchmark, empaqueta los artefactos en
+`/kaggle/working/tfm_maxsat_artifacts.zip` y publica los resultados en una rama
+`kaggle-results/<marca-temporal>` del repositorio configurado.
+
+Active **Internet** en las opciones del notebook. Alternativamente, adjunte ambos
+datasets a la sesión para evitar descargas:
+
+1. [JSRT 247 Image Lung Segmentation Mask Dataset](https://www.kaggle.com/datasets/abduzzami/jsrt-247-image-lung-segmentation-mask-dataset)
+   (`abduzzami/jsrt-247-image-lung-segmentation-mask-dataset`, Apache-2.0): contiene
+   247 RX bajo `content/jsrt/cxr/` y las **máscaras pulmonares** bajo
+   `content/jsrt/masks/`.
+2. [Nodules in Chest X-rays (JSRT)](https://www.kaggle.com/datasets/raddar/nodules-in-chest-xrays-jsrt)
+   (`raddar/nodules-in-chest-xrays-jsrt`, licencia declarada por Kaggle: *Unknown*):
+   contiene `jsrt_metadata.csv`, con los 154 casos `JPCLN`, su centro `x,y`, tamaño
+   clínico `size` y estado diagnóstico. El cuaderno conserva SHA-256 y referencias
+   de ambas fuentes en `kaggle_jsrt_manifest.json`.
+
+La segunda fuente **no proporciona contornos manuales de nódulo a nivel de píxel**.
+Por ello, el pipeline construye una máscara circular a partir de centro y diámetro
+clínico (0,175 mm/píxel; referencia JSRT 2048×2048) y marca cada salida con
+`ground_truth_representation=circle_from_coordinate_diameter`. IoU, Dice, cobertura
+y precisión se deben interpretar frente a esta aproximación geométrica, no como
+comparación con una segmentación clínica manual. Las máscaras de `masks/` del primer
+dataset se utilizan únicamente para restringir SLIC al pulmón.
+
+Para publicar automáticamente desde Kaggle, cree el secreto del notebook
+`GITHUB_TOKEN` con un Fine-Grained Personal Access Token que tenga permiso
+**Contents: Read and write** sobre `ttromas-arch/tfm-maxsat-xai`. El token nunca se
+escribe en el notebook, resultados ni Git; sin ese secreto la ejecución llega hasta
+los artefactos de `/kaggle/working` y termina con una instrucción explícita para
+configurarlo. El cuaderno publica en una rama nueva, no sobrescribe `main`.
+
+#### Referencias de datos y uso responsable
+
+- **Base JSRT original:** J. Shiraishi *et al.*, “Development of a digital image
+  database for chest radiographs with and without a lung nodule: receiver operating
+  characteristic analysis of radiologists' detection of pulmonary nodules”, *AJR
+  American Journal of Roentgenology*, 174(1), 71–74, 2000.
+  [https://doi.org/10.2214/ajr.174.1.1740071](https://doi.org/10.2214/ajr.174.1.1740071).
+- **RX y máscaras pulmonares usadas por el cuaderno:** Abduz Zami,
+  [*JSRT 247 Image Lung Segmentation Mask Dataset*](https://www.kaggle.com/datasets/abduzzami/jsrt-247-image-lung-segmentation-mask-dataset),
+  Kaggle, versión 1 (2024-07-13), licencia declarada **Apache-2.0**.
+- **Centros y tamaños de nódulos usados por el cuaderno:** raddar,
+  [*Nodules in Chest X-rays (JSRT)*](https://www.kaggle.com/datasets/raddar/nodules-in-chest-xrays-jsrt),
+  Kaggle, versión 1 (2020-02-18). Kaggle declara su licencia como **Unknown**;
+  compruebe los términos de la fuente original y cite la base JSRT primaria antes de
+  redistribuir resultados, imágenes o derivados.
+
+El manifiesto de cada ejecución registra los *slugs* de Kaggle, los conteos de IDs,
+la representación del GT y SHA-256 de `jsrt_metadata.csv`. Esto permite detectar un
+cambio silencioso de fuente y reproducir exactamente la transformación aplicada.
+
 ## Prueba extrema a extremo
 
 ```powershell

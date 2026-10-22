@@ -8,6 +8,7 @@ data/raw/
 data/processed/
 data/_integration_jsrt/
 outputs/
+kaggle_artifacts/
 *.pt
 *.pth
 *.ckpt

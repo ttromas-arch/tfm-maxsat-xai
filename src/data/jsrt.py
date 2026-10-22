@@ -44,16 +44,30 @@ _DIAMETER_COLUMNS = (
 )
 _RADIUS_COLUMNS = ("radius", "radius_px", "radius_mm", "nodule_radius", "nodule_radius_mm")
 _PRESENCE_COLUMNS = ("has_nodule", "nodule", "is_nodule", "positive")
+_COORDINATE_WIDTH_COLUMNS = (
+    "coordinate_width",
+    "coordinate_reference_width",
+    "reference_width",
+    "source_width",
+)
+_COORDINATE_HEIGHT_COLUMNS = (
+    "coordinate_height",
+    "coordinate_reference_height",
+    "reference_height",
+    "source_height",
+)
 
 
 @dataclass(frozen=True)
 class NoduleAnnotation:
-    """Official or backup CSV nodule center and diameter in source-image pixels."""
+    """Nodule centre and diameter with an optional coordinate reference image size."""
 
     image_id: str
     x: float
     y: float
     diameter: float
+    coordinate_width: int | None = None
+    coordinate_height: int | None = None
 
 
 @dataclass(frozen=True)
@@ -147,6 +161,8 @@ def load_nodule_annotations(
     diameter_column = _select_column(names, _DIAMETER_COLUMNS, required=False)
     radius_column = _select_column(names, _RADIUS_COLUMNS, required=False)
     presence_column = _select_column(names, _PRESENCE_COLUMNS, required=False)
+    coordinate_width_column = _select_column(names, _COORDINATE_WIDTH_COLUMNS, required=False)
+    coordinate_height_column = _select_column(names, _COORDINATE_HEIGHT_COLUMNS, required=False)
     annotations: dict[str, NoduleAnnotation] = {}
     for row_number, row in enumerate(reader, start=2):
         if presence_column and not _truthy(row.get(presence_column)):
@@ -165,16 +181,39 @@ def load_nodule_annotations(
                     diameter /= pixel_spacing_mm
             else:
                 diameter = default_diameter_px
+            coordinate_width = (
+                int(float(str(row.get(coordinate_width_column) or "").strip()))
+                if coordinate_width_column and str(row.get(coordinate_width_column) or "").strip()
+                else None
+            )
+            coordinate_height = (
+                int(float(str(row.get(coordinate_height_column) or "").strip()))
+                if coordinate_height_column and str(row.get(coordinate_height_column) or "").strip()
+                else None
+            )
         except (TypeError, ValueError) as error:
             raise ValueError(f"invalid coordinate at CSV row {row_number}") from error
         if diameter <= 0:
             raise ValueError(f"diameter must be positive at CSV row {row_number}")
+        if (coordinate_width is None) != (coordinate_height is None):
+            raise ValueError(
+                f"coordinate reference width and height must both be set at CSV row {row_number}"
+            )
+        if coordinate_width is not None and min(coordinate_width, coordinate_height or 0) <= 0:
+            raise ValueError(f"coordinate reference dimensions must be positive at CSV row {row_number}")
         identifier = stable_stem(str(row[id_column]))
         if not identifier:
             raise ValueError(f"empty image identifier at CSV row {row_number}")
         if identifier in annotations:
             raise ValueError(f"duplicate annotation for image identifier {identifier}")
-        annotations[identifier] = NoduleAnnotation(identifier, x, y, diameter)
+        annotations[identifier] = NoduleAnnotation(
+            identifier,
+            x,
+            y,
+            diameter,
+            coordinate_width=coordinate_width,
+            coordinate_height=coordinate_height,
+        )
     return annotations
 
 
@@ -190,7 +229,9 @@ def create_nodule_mask(
     target_height, target_width = output_shape
     if min(source_height, source_width, target_height, target_width) <= 0:
         raise ValueError("source_shape and output_shape must be positive")
-    scale_x, scale_y = target_width / source_width, target_height / source_height
+    coordinate_width = annotation.coordinate_width or source_width
+    coordinate_height = annotation.coordinate_height or source_height
+    scale_x, scale_y = target_width / coordinate_width, target_height / coordinate_height
     center_x, center_y = annotation.x * scale_x, annotation.y * scale_y
     radius_x, radius_y = max(annotation.diameter * scale_x / 2.0, 0.5), max(
         annotation.diameter * scale_y / 2.0, 0.5
@@ -258,8 +299,8 @@ class JSRTDataset:
         root: str | Path,
         nodule_csv: str | Path | None = None,
         output_shape: tuple[int, int] = (224, 224),
-        image_dir: str = "images",
-        lung_mask_dir: str = "lung_masks",
+        image_dir: str | Path | None = None,
+        lung_mask_dir: str | Path | None = None,
     ) -> None:
         self.root = Path(root)
         self.output_shape = output_shape
@@ -267,8 +308,12 @@ class JSRTDataset:
             raise FileNotFoundError(f"JSRT root does not exist: {self.root}")
         candidate_csv = Path(nodule_csv) if nodule_csv else self._discover_csv()
         self.annotations = load_nodule_annotations(candidate_csv) if candidate_csv else {}
-        self.images = self._discover_files(self.root / image_dir, "image")
-        self.lung_masks = self._discover_files(self.root / lung_mask_dir, "lung mask")
+        image_root = self._resolve_data_directory(image_dir, ("cxr", "images", "image"), "image")
+        mask_root = self._resolve_data_directory(
+            lung_mask_dir, ("mask", "masks", "lung_masks", "lung_mask"), "lung mask"
+        )
+        self.images = self._discover_files(image_root, "image")
+        self.lung_masks = self._discover_files(mask_root, "lung mask")
 
     def _discover_csv(self) -> Path | None:
         preferred = ("nodules.csv", "nodule_coordinates.csv", "nodules_official.csv")
@@ -279,8 +324,51 @@ class JSRTDataset:
         tables = sorted(self.root.glob("*.csv"))
         return tables[0] if tables else None
 
-    def _discover_files(self, preferred: Path, kind: str) -> dict[str, Path]:
-        root = preferred if preferred.is_dir() else self.root
+    def _resolve_data_directory(
+        self,
+        explicit: str | Path | None,
+        aliases: tuple[str, ...],
+        kind: str,
+    ) -> Path:
+        """Resolve explicit or conventional Local/Kaggle image subdirectories.
+
+        Kaggle's JSRT lung dataset uses ``content/jsrt/cxr`` and
+        ``content/jsrt/masks``. Local exports historically use ``images`` and
+        ``lung_masks``. Discovery selects the candidate with the most supported
+        image files, rejecting ambiguous ties to prevent image/mask mixing.
+        """
+        if explicit is not None:
+            candidate = Path(explicit)
+            candidate = candidate if candidate.is_absolute() else self.root / candidate
+            if not candidate.is_dir():
+                raise FileNotFoundError(f"configured {kind} directory does not exist: {candidate}")
+            return candidate
+        candidates = [
+            path
+            for path in self.root.rglob("*")
+            if path.is_dir() and path.name.strip().lower() in aliases
+        ]
+        if self.root.name.strip().lower() in aliases:
+            candidates.append(self.root)
+        scored = [
+            (
+                sum(1 for file in path.rglob("*") if file.suffix.lower() in _IMAGE_EXTENSIONS),
+                path,
+            )
+            for path in candidates
+        ]
+        viable = [(count, path) for count, path in scored if count]
+        if not viable:
+            raise FileNotFoundError(
+                f"no {kind} directory found below {self.root}; expected one of {aliases}"
+            )
+        maximum = max(count for count, _ in viable)
+        winners = sorted(path for count, path in viable if count == maximum)
+        if len(winners) > 1:
+            raise ValueError(f"ambiguous {kind} directories beneath {self.root}: {winners}")
+        return winners[0]
+
+    def _discover_files(self, root: Path, kind: str) -> dict[str, Path]:
         files = sorted(path for path in root.rglob("*") if path.suffix.lower() in _IMAGE_EXTENSIONS)
         if not files:
             raise FileNotFoundError(f"no {kind} files found beneath {root}")

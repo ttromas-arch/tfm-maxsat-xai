@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shutil
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -33,6 +34,10 @@ class ExperimentConfig:
     output_dir: str
     nodule_csv: str | None
     nodule_url: str | None
+    image_dir: str | None
+    lung_mask_dir: str | None
+    ground_truth_representation: str
+    provenance_manifest: str | None
     num_superpixels: int
     slic_compactness: float
     threshold: float
@@ -56,6 +61,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="outputs/jsrt_run")
     parser.add_argument("--nodule-csv", default=None)
     parser.add_argument("--nodule-url", default=None, help="Optional official coordinate CSV URL")
+    parser.add_argument(
+        "--image-dir",
+        default=None,
+        help="Optional image directory relative to --jsrt-root or absolute (e.g. cxr)",
+    )
+    parser.add_argument(
+        "--lung-mask-dir",
+        default=None,
+        help="Optional lung-mask directory relative to --jsrt-root or absolute (e.g. masks)",
+    )
+    parser.add_argument(
+        "--ground-truth-representation",
+        default="circle_from_coordinate_diameter",
+        help="Auditable GT label recorded in each metric row",
+    )
+    parser.add_argument(
+        "--provenance-manifest",
+        default=None,
+        help="Optional JSON manifest copied into the experiment output",
+    )
     parser.add_argument("--num-superpixels", type=int, default=50)
     parser.add_argument("--slic-compactness", type=float, default=0.15)
     parser.add_argument("--threshold", type=float, default=0.20)
@@ -131,6 +156,10 @@ def run(args: argparse.Namespace) -> Path:
         output_dir=str(output_dir),
         nodule_csv=str(nodule_csv) if nodule_csv else None,
         nodule_url=args.nodule_url,
+        image_dir=args.image_dir,
+        lung_mask_dir=args.lung_mask_dir,
+        ground_truth_representation=args.ground_truth_representation,
+        provenance_manifest=args.provenance_manifest,
         num_superpixels=args.num_superpixels,
         slic_compactness=args.slic_compactness,
         threshold=args.threshold,
@@ -147,7 +176,17 @@ def run(args: argparse.Namespace) -> Path:
         seed=args.seed,
     )
     (output_dir / "config.json").write_text(json.dumps(asdict(config), indent=2), encoding="utf-8")
-    dataset = JSRTDataset(jsrt_root, nodule_csv=nodule_csv)
+    if args.provenance_manifest:
+        source_manifest = Path(args.provenance_manifest)
+        if not source_manifest.is_file():
+            raise FileNotFoundError(f"provenance manifest does not exist: {source_manifest}")
+        shutil.copy2(source_manifest, output_dir / "ground_truth_provenance.json")
+    dataset = JSRTDataset(
+        jsrt_root,
+        nodule_csv=nodule_csv,
+        image_dir=args.image_dir,
+        lung_mask_dir=args.lung_mask_dir,
+    )
     identifiers = dataset.image_ids(nodules_only=True)
     if not identifiers:
         raise RuntimeError("no image with both lung mask and nodule coordinate was found")
@@ -217,7 +256,10 @@ def run(args: argparse.Namespace) -> Path:
                         image_id=image_id,
                         solution_index=solution_index,
                         diversity_jaccard=diversity,
-                        extra_fields={"source_path": str(sample.source_path)},
+                        extra_fields={
+                            "source_path": str(sample.source_path),
+                            "ground_truth_representation": args.ground_truth_representation,
+                        },
                     )
                     _append_incremental(record, results_csv)
                 panel_masks[method] = partition.mask_from_activation(solutions[0].activation, off=True)

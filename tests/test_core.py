@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import numpy as np
 import pytest
 from PIL import Image
 
 from scripts.smoke_test import synthetic_radiograph
+from src.data.kaggle_jsrt import prepare_kaggle_jsrt
 from src.data.jsrt import JSRTDataset, load_nodule_annotations
 from src.data.superpixels import build_slic_partition
 from src.evaluation.metrics import binary_mask_metrics, jaccard_distance
@@ -90,3 +94,53 @@ def test_dataset_loads_and_normalizes_raw_jsrt_image(tmp_path) -> None:
     assert sample.gt_nodule_mask.any()
     assert sample.image.min() == pytest.approx(0.0)
     assert sample.image.max() == pytest.approx(1.0)
+
+
+def test_kaggle_layout_and_metadata_are_prepared_with_reference_coordinates(tmp_path) -> None:
+    lung_root = tmp_path / "lung_input" / "content" / "jsrt"
+    metadata_root = tmp_path / "metadata_input"
+    cxr, masks = lung_root / "cxr", lung_root / "masks"
+    cxr.mkdir(parents=True)
+    masks.mkdir()
+    metadata_root.mkdir()
+    Image.fromarray(np.full((32, 32), 127, dtype=np.uint8)).save(cxr / "JPCLN001.png")
+    Image.fromarray(np.full((32, 32), 255, dtype=np.uint8)).save(masks / "JPCLN001.png")
+    (metadata_root / "jsrt_metadata.csv").write_text(
+        "study_id,subtlety,size,age,gender,x,y,state,position,diagnosis\n"
+        "JPCLN001.png,5,17.5,53,Male,1024,1024,malignant,l.upper lobe,lung cancer\n"
+        "JPCNN001.png,,,30,Female,,,non-nodule,,\n",
+        encoding="utf-8",
+    )
+    preparation, manifest = prepare_kaggle_jsrt(lung_root.parents[1], metadata_root, tmp_path / "prepared")
+    assert preparation.annotated_nodule_count == 1
+    assert preparation.matched_pair_count == 1
+    assert manifest.is_file()
+    sample = JSRTDataset(
+        lung_root.parents[1],
+        nodule_csv=preparation.nodule_csv,
+        image_dir=preparation.image_dir,
+        lung_mask_dir=preparation.lung_mask_dir,
+    ).load("JPCLN001")
+    assert sample.gt_nodule_mask[112, 112]
+    assert sample.gt_nodule_mask.sum() > 0
+    annotation = load_nodule_annotations(preparation.nodule_csv)["jpcln001"]
+    assert annotation.diameter == pytest.approx(100.0)
+    assert annotation.coordinate_width == 2048
+
+
+def test_kaggle_notebook_is_valid_python_and_has_safe_publication_contract() -> None:
+    notebook_path = Path(__file__).resolve().parents[1] / "kaggle_runner.ipynb"
+    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+    assert notebook["nbformat"] == 4
+    code = ""
+    for index, cell in enumerate(notebook["cells"]):
+        if cell["cell_type"] == "code":
+            source = "".join(cell["source"])
+            compile(source, f"kaggle_runner.ipynb:cell-{index}", "exec")
+            code += source
+    assert "kagglehub.dataset_download" in code
+    assert "THRESHOLD_MODE = 'relative'" in code
+    assert "--overwrite" in code
+    assert "UserSecretsClient().get_secret('GITHUB_TOKEN')" in code
+    assert ".github_askpass.sh" in code
+    assert "https://x-access-token:" not in code
