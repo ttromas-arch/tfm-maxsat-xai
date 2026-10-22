@@ -1,0 +1,18 @@
+# Recommended interpreter: Python >=3.10,<3.13.
+# Install PyTorch from https://pytorch.org/get-started/locally/ if needed.
+numpy>=1.24,<3
+pandas>=2.0,<3
+scipy>=1.10,<2
+scikit-image>=0.21,<0.26
+opencv-python>=4.8,<5
+matplotlib>=3.7,<4
+seaborn>=0.13,<1
+tabulate>=0.9,<1
+Pillow>=10,<12
+python-sat>=1.8.dev1
+requests>=2.31,<3
+tqdm>=4.66,<5
+torch>=2.1,<3
+torchvision>=0.16,<1
+torchxrayvision>=1.2.4,<2
+pytest>=8,<10
