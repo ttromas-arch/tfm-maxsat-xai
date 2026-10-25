@@ -1,0 +1,17 @@
+{
+  "lung_dataset_ref": "abduzzami/jsrt-247-image-lung-segmentation-mask-dataset",
+  "metadata_dataset_ref": "raddar/nodules-in-chest-xrays-jsrt",
+  "image_dir": "/kaggle/input/datasets/abduzzami/jsrt-247-image-lung-segmentation-mask-dataset/content/jsrt/cxr",
+  "lung_mask_dir": "/kaggle/input/datasets/abduzzami/jsrt-247-image-lung-segmentation-mask-dataset/content/jsrt/masks",
+  "nodule_csv": "/kaggle/working/jsrt_prepared/nodules_from_jsrt_metadata.csv",
+  "metadata_csv": "/kaggle/input/datasets/raddar/nodules-in-chest-xrays-jsrt/jsrt_metadata.csv",
+  "metadata_sha256": "f35076411f4b41218b752e7311c0ae64f9bef031ee3de1d54d3ba898e853874e",
+  "image_count": 247,
+  "lung_mask_count": 247,
+  "matched_pair_count": 247,
+  "annotated_nodule_count": 154,
+  "coordinate_reference_width": 2048,
+  "coordinate_reference_height": 2048,
+  "nodule_gt_representation": "circle_from_coordinate_diameter",
+  "notes": "Nodule masks are reconstructed circles from centre coordinates and clinical diameter metadata; they are not manual pixel-level nodule segmentations."
+}

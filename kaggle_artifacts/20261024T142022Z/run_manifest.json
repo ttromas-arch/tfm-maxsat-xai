@@ -1,0 +1,10 @@
+{
+  "run_id": "20261024T142022Z",
+  "repository": "ttromas-arch/tfm-maxsat-xai",
+  "repository_commit": "be0897b38bc67f64f433477609f89974dc1061d7",
+  "lung_dataset_ref": "abduzzami/jsrt-247-image-lung-segmentation-mask-dataset",
+  "metadata_dataset_ref": "raddar/nodules-in-chest-xrays-jsrt",
+  "results_rows": 670,
+  "validity_sum": 159,
+  "ground_truth_representation": "circle_from_coordinate_diameter"
+}
