@@ -19,7 +19,12 @@ from src.evaluation.metrics import evaluate_counterfactual, mean_diversity_jacca
 from src.explainers.partial_maxsat import PartialMaxSATCounterfactualExplainer
 from src.models.classifier import SyntheticNoduleClassifier, TorchXRayVisionNoduleClassifier
 from src.occlusion.engine import OCCLUSION_METHODS, OcclusionEngine
-from src.visualization.plots import plot_patient_panel
+from src.visualization.plots import (
+    plot_ground_truth_construction,
+    plot_maxsat_explanation_process,
+    plot_occlusion_method_comparison,
+    plot_patient_panel,
+)
 
 
 def synthetic_radiograph(size: int = 96) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -44,11 +49,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", default="outputs/smoke_test")
     parser.add_argument("--exercise-torchxrayvision", action="store_true")
+    parser.add_argument("--save-successful-examples", type=int, default=0)
     parser.add_argument("--seed", type=int, default=7)
     return parser.parse_args()
 
 
-def run(output_dir: str | Path, seed: int = 7) -> dict[str, object]:
+def run(output_dir: str | Path, seed: int = 7, save_successful_examples: int = 0) -> dict[str, object]:
     """Execute every core method and return a JSON-serializable validation report."""
     seed_everything(seed)
     destination = ensure_directory(output_dir)
@@ -75,6 +81,7 @@ def run(output_dir: str | Path, seed: int = 7) -> dict[str, object]:
     records: list[dict[str, object]] = []
     masks: dict[str, np.ndarray] = {}
     statuses: dict[str, str] = {}
+    first_result = None
     for index, method in enumerate(OCCLUSION_METHODS):
         explainer = PartialMaxSATCounterfactualExplainer(
             partition=partition,
@@ -97,6 +104,8 @@ def run(output_dir: str | Path, seed: int = 7) -> dict[str, object]:
         if result.counterfactual_probability >= result.threshold:
             raise AssertionError(f"{method} did not cross its threshold")
         masks[method] = partition.mask_from_activation(result.activation)
+        if first_result is None:
+            first_result = result
         statuses[method] = result.status
         diversity = mean_diversity_jaccard(solutions)
         records.extend(
@@ -117,6 +126,39 @@ def run(output_dir: str | Path, seed: int = 7) -> dict[str, object]:
     csv_path = destination / "smoke_results.csv"
     frame.to_csv(csv_path, index=False)
     panel_path = plot_patient_panel(image, gt_mask, partition, masks, destination / "smoke_panel.png", "synthetic")
+    example_paths: list[str] = []
+    if save_successful_examples > 0 and first_result is not None:
+        examples = ensure_directory(destination / "successful_examples" / "synthetic")
+        gt_labels = np.unique(partition.labels[gt_mask & (partition.labels >= 0)])
+        diagnostic_activation = np.ones(partition.num_superpixels, dtype=bool)
+        diagnostic_activation[gt_labels] = False
+        diagnostic_mask = partition.mask_from_activation(diagnostic_activation, off=True)
+        example_paths = [
+            str(
+                plot_occlusion_method_comparison(
+                    image, partition, diagnostic_mask, examples / "occlusion_method_comparison.png", "synthetic", engine
+                )
+            ),
+            str(
+                plot_ground_truth_construction(
+                    image, lung_mask, gt_mask, examples / "ground_truth_construction.png", "synthetic")
+            ),
+            str(
+                plot_maxsat_explanation_process(
+                    image,
+                    partition,
+                    gt_mask,
+                    first_result.sensitivity,
+                    partition.mask_from_activation(first_result.activation, off=True),
+                    examples / "maxsat_process.png",
+                    "synthetic",
+                    first_result.occlusion_method,
+                    1.0,
+                    1.0,
+                    1.0,
+                )
+            ),
+        ]
     report = {
         "status": "passed",
         "num_superpixels": partition.num_superpixels,
@@ -124,6 +166,7 @@ def run(output_dir: str | Path, seed: int = 7) -> dict[str, object]:
         "perturbation_mean_absolute_difference": perturbation_stats,
         "result_csv": str(csv_path),
         "panel": str(panel_path),
+        "successful_example_paths": example_paths,
     }
     (destination / "smoke_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     return report
@@ -131,7 +174,7 @@ def run(output_dir: str | Path, seed: int = 7) -> dict[str, object]:
 
 def main() -> None:
     args = parse_args()
-    report = run(args.output_dir, args.seed)
+    report = run(args.output_dir, args.seed, args.save_successful_examples)
     if args.exercise_torchxrayvision:
         # Validate initialization and preprocessor separately: a synthetic image is
         # not a clinically interpretable inference target.

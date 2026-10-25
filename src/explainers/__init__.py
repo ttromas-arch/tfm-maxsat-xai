@@ -3,7 +3,15 @@
 from src.explainers.partial_maxsat import (
     CounterfactualResult,
     PartialMaxSATCounterfactualExplainer,
+    SearchState,
     calibrate_threshold,
+    counterfactual_trace,
 )
 
-__all__ = ["CounterfactualResult", "PartialMaxSATCounterfactualExplainer", "calibrate_threshold"]
+__all__ = [
+    "CounterfactualResult",
+    "PartialMaxSATCounterfactualExplainer",
+    "SearchState",
+    "calibrate_threshold",
+    "counterfactual_trace",
+]

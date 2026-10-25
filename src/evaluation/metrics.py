@@ -104,6 +104,10 @@ def evaluate_counterfactual(
     lung_area = int(partition.anatomy_mask.sum())
     occluded_area = int(off_mask.sum())
     absolute_drop = result.original_probability - result.counterfactual_probability
+    finite_sensitivity = result.sensitivity[np.isfinite(result.sensitivity)]
+    selected = ~result.activation
+    selected_sensitivity = result.sensitivity[selected]
+    selected_guidance = result.guidance_penalties[selected]
     record: dict[str, object] = {
         "image_id": image_id,
         "solution_index": int(solution_index),
@@ -117,6 +121,8 @@ def evaluate_counterfactual(
         "prob_drop": float(absolute_drop),
         "relative_prob_drop": _safe_ratio(absolute_drop, result.original_probability),
         "num_superpixels": int(partition.num_superpixels),
+        "solver_superpixel_count": int(result.solver_superpixel_indices.size),
+        "frozen_outside_lung_count": int(result.frozen_outside_lung_indices.size),
         "num_occluded_superpixels": int((~result.activation).sum()),
         "sparsity_ratio": float((~result.activation).mean()),
         "occluded_area_ratio": _safe_ratio(occluded_area, total_area),
@@ -126,12 +132,28 @@ def evaluate_counterfactual(
         "superpixel_gt_correlation": superpixel_gt_correlation(
             result.sensitivity, partition.gt_overlap_of_superpixel
         ),
+        "seed_evaluated_superpixels": int(np.isfinite(result.seed_probabilities).sum()),
+        "seed_num_probability_decrease": int(np.sum(finite_sensitivity > 0.0)),
+        "seed_num_probability_increase": int(np.sum(finite_sensitivity < 0.0)),
+        "seed_max_prob_drop": float(np.max(finite_sensitivity)) if finite_sensitivity.size else float("nan"),
+        "seed_mean_prob_drop": float(np.mean(finite_sensitivity)) if finite_sensitivity.size else float("nan"),
+        "selected_mean_seed_drop": result.selected_mean_seed_drop,
+        "selected_min_seed_drop": result.selected_min_seed_drop,
+        "selected_num_artifact_increasing_regions": int(np.sum(selected_sensitivity < 0.0)),
+        "occlusion_base_cost": int(result.base_weights[selected].sum()),
+        "sensitivity_tiebreak_cost": int(selected_guidance.sum()),
         "solver_time_sec": float(result.solver_time_sec),
         "total_time_sec": float(result.total_time_sec),
         "oracle_calls": int(result.oracle_calls),
         "num_hard_clauses": int(result.num_hard_clauses),
         "num_soft_clauses": int(result.num_soft_clauses),
         "objective_cost": result.objective_cost,
+        "cegar_cut_mode": result.cegar_cut_mode,
+        "search_lane": result.search_lane,
+        "exact_block_count": int(result.exact_block_count),
+        "expansion_cut_count": int(result.expansion_cut_count),
+        "oracle_cache_hits": int(result.oracle_cache_hits),
+        "oracle_cache_misses": int(result.oracle_cache_misses),
         "diversity_jaccard": float(diversity_jaccard),
         **pixel_metrics,
     }

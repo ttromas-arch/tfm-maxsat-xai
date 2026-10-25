@@ -10,6 +10,7 @@ import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,10 +21,17 @@ from src.common import ensure_directory, seed_everything
 from src.data.jsrt import JSRTDataset, download_nodule_coordinates
 from src.data.superpixels import build_slic_partition
 from src.evaluation.metrics import evaluate_counterfactual, mean_diversity_jaccard
-from src.explainers.partial_maxsat import PartialMaxSATCounterfactualExplainer
+from src.explainers.partial_maxsat import PartialMaxSATCounterfactualExplainer, counterfactual_trace
 from src.models.classifier import SyntheticNoduleClassifier, TorchXRayVisionNoduleClassifier
 from src.occlusion.engine import OCCLUSION_METHODS, OcclusionEngine
-from src.visualization.plots import plot_aggregate_distributions, plot_patient_panel, write_summary_tables
+from src.visualization.plots import (
+    plot_aggregate_distributions,
+    plot_ground_truth_construction,
+    plot_maxsat_explanation_process,
+    plot_occlusion_method_comparison,
+    plot_patient_panel,
+    write_summary_tables,
+)
 
 
 @dataclass(frozen=True)
@@ -47,6 +55,15 @@ class ExperimentConfig:
     exploration_random_samples: int
     diverse_solutions: int
     repetition_penalty: int | None
+    minimum_new_occluded_regions: int
+    cegar_cut_mode: str
+    seed_guidance_weight: float
+    anti_sensitivity_penalty: float
+    low_sensitivity_penalty: float
+    sensitivity_normalization: str
+    minimum_lung_overlap: float
+    hybrid_exact_budget_fraction: float
+    save_successful_examples: int
     classifier: str
     device: str
     batch_size: int
@@ -90,6 +107,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--exploration-random-samples", type=int, default=0)
     parser.add_argument("--diverse-solutions", type=int, default=1)
     parser.add_argument("--repetition-penalty", type=int, default=None)
+    parser.add_argument("--minimum-new-occluded-regions", type=int, default=1)
+    parser.add_argument("--cegar-cut-mode", choices=("exact", "expansion", "hybrid"), default="exact")
+    parser.add_argument("--seed-guidance-weight", type=float, default=1.0)
+    parser.add_argument("--anti-sensitivity-penalty", type=float, default=4.0)
+    parser.add_argument("--low-sensitivity-penalty", type=float, default=1.0)
+    parser.add_argument("--sensitivity-normalization", choices=("rank", "minmax"), default="rank")
+    parser.add_argument("--minimum-lung-overlap", type=float, default=0.0)
+    parser.add_argument("--hybrid-exact-budget-fraction", type=float, default=0.5)
+    parser.add_argument(
+        "--save-successful-examples",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Generate academic figures for the first N distinct valid cases with IoU > 0.10",
+    )
     parser.add_argument("--classifier", choices=("torchxrayvision", "synthetic"), default="torchxrayvision")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"), default="auto")
     parser.add_argument("--batch-size", type=int, default=16)
@@ -109,6 +141,12 @@ def _make_classifier(args: argparse.Namespace):
 def _append_incremental(record: dict[str, object], output_csv: Path) -> None:
     frame = pd.DataFrame([record])
     frame.to_csv(output_csv, mode="a", header=not output_csv.exists(), index=False)
+
+
+def _append_trace(trace: dict[str, object], trace_path: Path) -> None:
+    """Persist a JSONL trace atomically at the solution granularity."""
+    with trace_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(trace, ensure_ascii=False, allow_nan=False) + "\n")
 
 
 def _completed_pairs(marker_path: Path) -> set[tuple[str, str]]:
@@ -139,12 +177,126 @@ def _write_failure(path: Path, image_id: str, method: str, error: Exception) -> 
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
+def _load_traces(trace_path: Path) -> list[dict[str, object]]:
+    """Load strict JSONL traces, reporting malformed line numbers for reproducibility."""
+    traces: list[dict[str, object]] = []
+    if not trace_path.exists():
+        return traces
+    for line_number, line in enumerate(trace_path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"malformed explanation trace at {trace_path}:{line_number}") from error
+        if not isinstance(payload, dict):
+            raise ValueError(f"trace must be a JSON object at {trace_path}:{line_number}")
+        traces.append(payload)
+    return traces
+
+
+def _save_successful_examples(
+    dataset: JSRTDataset,
+    results: pd.DataFrame,
+    traces: list[dict[str, object]],
+    args: argparse.Namespace,
+    output_dir: Path,
+) -> int:
+    """Rebuild selected valid cases from traces and save the three requested figures."""
+    if args.save_successful_examples <= 0:
+        return 0
+    if not traces:
+        logging.warning("No explanation traces available; successful examples cannot be regenerated")
+        return 0
+    required = {"image_id", "occlusion_method", "solution_index", "validity", "iou_nodule", "cf_prob"}
+    absent = required.difference(results.columns)
+    if absent:
+        logging.warning("Results lack example-selection columns: %s", sorted(absent))
+        return 0
+    trace_lookup = {
+        (str(trace["image_id"]), str(trace["occlusion_method"]), int(trace["solution_index"])): trace
+        for trace in traces
+    }
+    candidates = results[(results["validity"] == 1) & (results["iou_nodule"] > 0.10)].copy()
+    candidates = candidates.sort_values(
+        ["image_id", "iou_nodule", "cf_prob", "solution_index"],
+        ascending=[True, False, True, True],
+        kind="stable",
+    )
+    selected_rows: list[pd.Series] = []
+    seen_images: set[str] = set()
+    for _, row in candidates.iterrows():
+        image_id = str(row["image_id"])
+        key = (image_id, str(row["occlusion_method"]), int(row["solution_index"]))
+        if image_id not in seen_images and key in trace_lookup:
+            selected_rows.append(row)
+            seen_images.add(image_id)
+        if len(selected_rows) >= args.save_successful_examples:
+            break
+    examples_root = ensure_directory(output_dir / "successful_examples")
+    for row in selected_rows:
+        image_id = str(row["image_id"])
+        method = str(row["occlusion_method"])
+        solution_index = int(row["solution_index"])
+        trace = trace_lookup[(image_id, method, solution_index)]
+        sample = dataset.load(image_id)
+        partition = build_slic_partition(
+            sample.image,
+            sample.lung_mask,
+            sample.gt_nodule_mask,
+            num_segments=args.num_superpixels,
+            compactness=args.slic_compactness,
+            seed=args.seed,
+        )
+        activation = np.asarray(trace["activation"], dtype=bool)
+        if activation.shape != (partition.num_superpixels,):
+            logging.warning("Skipping stale trace for %s: SLIC cardinality differs", image_id)
+            continue
+        example_dir = ensure_directory(examples_root / image_id)
+        engine = OcclusionEngine(sample.image, partition)
+        diagnostic_labels = np.unique(partition.labels[sample.gt_nodule_mask & (partition.labels >= 0)])
+        diagnostic_activation = np.ones(partition.num_superpixels, dtype=bool)
+        diagnostic_activation[diagnostic_labels] = False
+        diagnostic_mask = partition.mask_from_activation(diagnostic_activation, off=True)
+        plot_occlusion_method_comparison(
+            sample.image,
+            partition,
+            diagnostic_mask,
+            example_dir / "occlusion_method_comparison.png",
+            image_id,
+            engine=engine,
+        )
+        plot_ground_truth_construction(
+            sample.image,
+            sample.lung_mask,
+            sample.gt_nodule_mask,
+            example_dir / "ground_truth_construction.png",
+            image_id,
+        )
+        sensitivity = np.asarray([np.nan if value is None else value for value in trace["sensitivity"]], dtype=float)
+        plot_maxsat_explanation_process(
+            sample.image,
+            partition,
+            sample.gt_nodule_mask,
+            sensitivity,
+            partition.mask_from_activation(activation, off=True),
+            example_dir / f"maxsat_process_{method}_solution_{solution_index}.png",
+            image_id,
+            method,
+            float(row["iou_nodule"]),
+            float(row["dice_nodule"]),
+            float(row["nodule_coverage"]),
+        )
+    return len(selected_rows)
+
+
 def run(args: argparse.Namespace) -> Path:
     """Execute benchmark and return its result CSV path."""
     seed_everything(args.seed)
     output_dir = ensure_directory(args.output_dir)
     figures_dir = ensure_directory(output_dir / "figures")
     results_csv = output_dir / "results.csv"
+    traces_path = output_dir / "explanation_traces.jsonl"
     failures_path = output_dir / "failures.jsonl"
     completed_path = output_dir / "completed_methods.jsonl"
     jsrt_root = Path(args.jsrt_root)
@@ -169,6 +321,15 @@ def run(args: argparse.Namespace) -> Path:
         exploration_random_samples=args.exploration_random_samples,
         diverse_solutions=args.diverse_solutions,
         repetition_penalty=args.repetition_penalty,
+        minimum_new_occluded_regions=args.minimum_new_occluded_regions,
+        cegar_cut_mode=args.cegar_cut_mode,
+        seed_guidance_weight=args.seed_guidance_weight,
+        anti_sensitivity_penalty=args.anti_sensitivity_penalty,
+        low_sensitivity_penalty=args.low_sensitivity_penalty,
+        sensitivity_normalization=args.sensitivity_normalization,
+        minimum_lung_overlap=args.minimum_lung_overlap,
+        hybrid_exact_budget_fraction=args.hybrid_exact_budget_fraction,
+        save_successful_examples=args.save_successful_examples,
         classifier=args.classifier,
         device=args.device,
         batch_size=args.batch_size,
@@ -195,6 +356,8 @@ def run(args: argparse.Namespace) -> Path:
     completed = set() if args.overwrite else _completed_pairs(completed_path)
     if args.overwrite and results_csv.exists():
         results_csv.unlink()
+    if args.overwrite and traces_path.exists():
+        traces_path.unlink()
     if args.overwrite and completed_path.exists():
         completed_path.unlink()
     classifier = _make_classifier(args)
@@ -238,10 +401,18 @@ def run(args: argparse.Namespace) -> Path:
                     max_oracle_calls=args.max_oracle_calls,
                     exploration_random_samples=args.exploration_random_samples,
                     random_seed=args.seed + method_index,
+                    cegar_cut_mode=args.cegar_cut_mode,
+                    seed_guidance_weight=args.seed_guidance_weight,
+                    anti_sensitivity_penalty=args.anti_sensitivity_penalty,
+                    low_sensitivity_penalty=args.low_sensitivity_penalty,
+                    sensitivity_normalization=args.sensitivity_normalization,
+                    minimum_lung_overlap=args.minimum_lung_overlap,
+                    hybrid_exact_budget_fraction=args.hybrid_exact_budget_fraction,
                 )
                 solutions = explainer.diverse_solutions(
                     maximum_solutions=args.diverse_solutions,
                     repetition_penalty=args.repetition_penalty,
+                    minimum_new_occluded_regions=args.minimum_new_occluded_regions,
                 )
                 if not solutions:
                     # Persist an invalid terminal trace instead of silently omitting it.
@@ -262,6 +433,7 @@ def run(args: argparse.Namespace) -> Path:
                         },
                     )
                     _append_incremental(record, results_csv)
+                    _append_trace(counterfactual_trace(solution, image_id, solution_index), traces_path)
                 panel_masks[method] = partition.mask_from_activation(solutions[0].activation, off=True)
                 _mark_completed(completed_path, image_id, method)
                 completed.add((image_id, method))
@@ -294,6 +466,11 @@ def run(args: argparse.Namespace) -> Path:
     write_summary_tables(results, summary_metrics, output_dir / "summary.md", output_dir / "summary.tex")
     plot_aggregate_distributions(results, summary_metrics, output_dir / "boxplots.png", kind="box")
     plot_aggregate_distributions(results, summary_metrics, output_dir / "violins.png", kind="violin")
+    saved_examples = _save_successful_examples(
+        dataset, results, _load_traces(traces_path), args, output_dir
+    )
+    if args.save_successful_examples:
+        logging.info("Generated academic artifacts for %d successful cases", saved_examples)
     logging.info("Completed benchmark: %s rows in %s", len(results), results_csv)
     return results_csv
 

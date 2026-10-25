@@ -143,14 +143,67 @@ se escribe tras completar cada método, de modo que al reanudar no se omiten res
 parciales. Los fallos aparecen en `failures.jsonl`. `--classifier synthetic` sirve
 solo para infraestructura, **no produce resultados clínicos**.
 
+### Búsqueda no monótona, trazas y casos de estudio
+
+DenseNet es un oráculo no monótono: apagar una región puede aumentar la probabilidad
+por un artefacto de oclusión. Por ello, el valor predeterminado
+`--cegar-cut-mode exact` bloquea únicamente la asignación completa ya evaluada. Es el
+único modo formalmente seguro para un clasificador arbitrario. Para una ablación se
+ofrecen `expansion` (corte monotónico de crecimiento) y `hybrid` (exacto seguido de
+expansión con presupuesto compartido); no deben interpretarse como garantías de
+minimalidad causal.
+
+Antes de RC2 se evalúa obligatoriamente cada oclusión singleton dentro del pulmón.
+La caída individual guía solo el desempate lexicográfico tras minimizar estrictamente
+cardinalidad/área. Las regiones cuya oclusión aumenta `P(Nodule)` reciben una
+penalización configurable:
+
+```powershell
+python scripts/run_experiments.py ... `
+  --cegar-cut-mode exact `
+  --seed-guidance-weight 1.0 `
+  --anti-sensitivity-penalty 4.0 `
+  --low-sensitivity-penalty 1.0 `
+  --minimum-new-occluded-regions 1
+```
+
+Cada ejecución escribe `explanation_traces.jsonl`, que almacena activaciones,
+sensibilidades, caché, pesos, cortes y configuración por solución. Para guardar los
+primeros `N` pacientes distintos con explicación válida e `iou_nodule > 0.10`:
+
+```powershell
+python scripts/run_experiments.py ... --save-successful-examples 5
+```
+
+Se crean, a 300 DPI, tres figuras bajo `successful_examples/<image_id>/`:
+
+1. comparación de los cuatro métodos aplicada a la misma región diagnóstica;
+2. RX, máscara pulmonar y construcción geométrica del GT;
+3. SLIC, heatmap singleton `ΔP`, explicación MaxSAT y superposición GT/CF.
+
+Todas las funciones de figuras liberan la memoria mediante `plt.close()` incluso si
+falla el guardado, por lo que son seguras para benchmarks prolongados en Kaggle.
+
+El presupuesto `--max-oracle-calls` debe ser al menos `M + 1`, donde `M` es el
+número de superpíxeles elegibles dentro del pulmón: una consulta para la RX original
+y una por cada singleton. El programa valida esta condición antes de iniciar RC2.
+
 ## Formulación y límites
 
 La variable `s_i` es verdadera cuando el superpíxel `i` se conserva. RC2 recibe la
 cláusula blanda `(s_i,w_i)` por región (`w_i=1` o su área), de forma que falsificarla
-equivale a pagar por ocultarla. Ante un candidato positivo del oráculo se añade el
-corte CEGAR `∨_{i:I(s_i)=1} ¬s_i`, exigiendo apagar otra región activa. MDSOL bloquea
-el modelo de activación completo de cada solución y agrega costes blandos por
-reutilizar regiones apagadas.
+equivale a pagar por ocultarla. Para un candidato fallido `I`, el modo predeterminado
+usa el bloqueo completo seguro:
+
+```text
+(∨_{I(s_i)=1} ¬s_i) ∨ (∨_{I(s_i)=0} s_i)
+```
+
+que excluye únicamente la asignación ya consultada. El corte de expansión
+`∨_{I(s_i)=1} ¬s_i` queda reservado para la ablación `expansion`/`hybrid`, pues asume
+una propiedad de monotonicidad que un clasificador de imágenes no garantiza. MDSOL
+bloquea las soluciones válidas completas, penaliza reutilización y puede exigir un
+número mínimo de regiones apagadas nuevas.
 
 El clasificador no es proposicional ni necesariamente monótono. La validez se
 verifica con inferencia real y la minimalidad se informa respecto a la abstracción
