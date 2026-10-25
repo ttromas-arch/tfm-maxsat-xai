@@ -8,6 +8,7 @@ for ablation, but is never presented as a sound non-monotonic inference rule.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Literal, Sequence
@@ -21,6 +22,8 @@ from src.occlusion.engine import OcclusionEngine, OcclusionMethod
 WeightMode = Literal["cardinality", "area"]
 CegarCutMode = Literal["exact", "expansion", "hybrid"]
 SensitivityNormalization = Literal["rank", "minmax"]
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -48,6 +51,9 @@ class SearchState:
     explored_assignments: int = 0
     seed_completed: bool = False
     guidance_penalties: np.ndarray | None = None
+    oracle_time_sec: float = 0.0
+    candidate_evaluations: int = 0
+    rc2_solves: int = 0
 
 
 @dataclass(frozen=True)
@@ -86,6 +92,8 @@ class CounterfactualResult:
     expansion_cut_count: int
     oracle_cache_hits: int
     oracle_cache_misses: int
+    oracle_time_sec: float
+    candidate_evaluations: int
 
     @property
     def occluded_indices(self) -> np.ndarray:
@@ -158,6 +166,8 @@ def counterfactual_trace(
         "oracle_calls": int(result.oracle_calls),
         "oracle_cache_hits": int(result.oracle_cache_hits),
         "oracle_cache_misses": int(result.oracle_cache_misses),
+        "oracle_time_sec": float(result.oracle_time_sec),
+        "candidate_evaluations": int(result.candidate_evaluations),
         "exact_block_count": int(result.exact_block_count),
         "expansion_cut_count": int(result.expansion_cut_count),
     }
@@ -214,6 +224,8 @@ class PartialMaxSATCounterfactualExplainer:
         sensitivity_normalization: SensitivityNormalization = "rank",
         minimum_lung_overlap: float = 0.0,
         hybrid_exact_budget_fraction: float = 0.5,
+        oracle_batch_size: int = 16,
+        timeout_seconds: float | None = None,
     ) -> None:
         if partition.num_superpixels != occlusion_engine.partition.num_superpixels:
             raise ValueError("partition and occlusion engine disagree about superpixel count")
@@ -235,6 +247,10 @@ class PartialMaxSATCounterfactualExplainer:
             raise ValueError("minimum_lung_overlap must lie in [0, 1]")
         if not 0.0 < hybrid_exact_budget_fraction < 1.0:
             raise ValueError("hybrid_exact_budget_fraction must lie strictly between zero and one")
+        if oracle_batch_size < 1:
+            raise ValueError("oracle_batch_size must be positive")
+        if timeout_seconds is not None and timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive or None")
         self.partition = partition
         self.engine = occlusion_engine
         self.oracle = oracle
@@ -252,6 +268,8 @@ class PartialMaxSATCounterfactualExplainer:
         self.sensitivity_normalization = sensitivity_normalization
         self.minimum_lung_overlap = float(minimum_lung_overlap)
         self.hybrid_exact_budget_fraction = float(hybrid_exact_budget_fraction)
+        self.oracle_batch_size = int(oracle_batch_size)
+        self.timeout_seconds = float(timeout_seconds) if timeout_seconds is not None else None
         self.rng = np.random.default_rng(random_seed)
         self.base_weights = (
             np.ones(partition.num_superpixels, dtype=np.int64)
@@ -323,7 +341,9 @@ class PartialMaxSATCounterfactualExplainer:
             return state.oracle_cache[key]
         if state.oracle_calls >= self.max_oracle_calls:
             raise RuntimeError("oracle budget exhausted")
+        inference_started = perf_counter()
         probability = float(self.oracle.predict_probability(self.engine.perturb(global_vector, self.occlusion_method)))
+        state.oracle_time_sec += perf_counter() - inference_started
         if not np.isfinite(probability) or not 0.0 <= probability <= 1.0:
             raise RuntimeError("oracle returned a probability outside [0, 1]")
         state.oracle_cache[key] = probability
@@ -355,7 +375,9 @@ class PartialMaxSATCounterfactualExplainer:
         if state.oracle_calls + len(uncached_images) > self.max_oracle_calls:
             raise RuntimeError("oracle budget exhausted")
         if uncached_images:
+            inference_started = perf_counter()
             probabilities = np.asarray(self.oracle.predict_probabilities(uncached_images), dtype=np.float64)
+            state.oracle_time_sec += perf_counter() - inference_started
             if probabilities.shape != (len(uncached_images),):
                 raise RuntimeError("oracle batch prediction has an invalid shape")
             if not np.isfinite(probabilities).all() or np.any(probabilities < 0) or np.any(probabilities > 1):
@@ -442,6 +464,7 @@ class PartialMaxSATCounterfactualExplainer:
         for variable, weight in enumerate(weights, start=1):
             formula.append([variable], weight=int(weight))
         started = perf_counter()
+        state.rc2_solves += 1
         with RC2(formula, adapt=False, exhaust=False, incr=False, verbose=0) as solver:
             model = solver.compute()
             objective = int(solver.cost) if model is not None else None
@@ -537,6 +560,8 @@ class PartialMaxSATCounterfactualExplainer:
             expansion_cut_count=state.expansion_cut_count,
             oracle_cache_hits=state.oracle_cache_hits,
             oracle_cache_misses=state.oracle_cache_misses,
+            oracle_time_sec=state.oracle_time_sec,
+            candidate_evaluations=state.candidate_evaluations,
         )
 
     def _search_lane(
@@ -660,40 +685,104 @@ class PartialMaxSATCounterfactualExplainer:
                 )
         last_activation, last_probability, last_cost = all_on, state.original_probability, 0
         call_limit = self.max_oracle_calls if oracle_call_limit is None else min(oracle_call_limit, self.max_oracle_calls)
+        deadline = None if self.timeout_seconds is None else started + self.timeout_seconds
+
+        def _add_block(clause: tuple[int, ...]) -> None:
+            if clause not in hard_set:
+                hard_clauses.append(clause)
+                hard_set.add(clause)
+
         while state.oracle_calls < call_limit:
-            local, objective = self._solve_rc2(hard_clauses, global_weights, state)
-            if local is None:
+            if deadline is not None and perf_counter() >= deadline:
+                return self._result(
+                    state, last_activation, last_probability, False, "timeout", last_cost,
+                    hard_clauses, global_weights, lane, started,
+                )
+            pending: list[tuple[np.ndarray, np.ndarray, int | None]] = []
+            unsat = False
+            while (
+                len(pending) < self.oracle_batch_size
+                and not unsat
+                and state.oracle_calls + len(pending) < call_limit
+            ):
+                if deadline is not None and perf_counter() >= deadline:
+                    break
+                local, objective = self._solve_rc2(hard_clauses, global_weights, state)
+                if local is None:
+                    unsat = True
+                    break
+                activation = self._to_global_activation(local)
+                key = self._activation_key(activation)
+                if key in state.oracle_cache:
+                    state.oracle_cache_hits += 1
+                    cached = state.oracle_cache[key]
+                    if cached < state.threshold:
+                        return self._result(
+                            state, activation, cached, True, "valid",
+                            objective, hard_clauses, global_weights, lane, started,
+                        )
+                    exact = self._exact_block_clause(local)
+                    if exact not in hard_set:
+                        hard_clauses.append(exact)
+                        hard_set.add(exact)
+                        state.exact_block_count += 1
+                        state.exact_block_clauses.add(exact)
+                    if lane == "expansion":
+                        expansion = self._expansion_cut_clause(local)
+                        if expansion is not None and expansion not in hard_set:
+                            hard_clauses.append(expansion)
+                            hard_set.add(expansion)
+                            state.expansion_cut_count += 1
+                            state.expansion_cut_clauses.add(expansion)
+                    continue
+                exact = self._exact_block_clause(local)
+                if exact in hard_set:
+                    continue
+                # Temporary block so the next RC2 solve returns a distinct candidate.
+                _add_block(exact)
+                pending.append((activation, local, objective))
+            if deadline is not None and perf_counter() >= deadline:
+                return self._result(
+                    state, last_activation, last_probability, False, "timeout", last_cost,
+                    hard_clauses, global_weights, lane, started,
+                )
+            if unsat and not pending:
                 return self._result(
                     state, last_activation, last_probability, False, "unsatisfiable", last_cost,
                     hard_clauses, global_weights, lane, started,
                 )
-            activation = self._to_global_activation(local)
+            if not pending:
+                break
+            matrices = np.stack([activation for activation, _, _ in pending])
             try:
-                probability = self._query_oracle(activation, state)
+                probabilities = self._query_oracle_many(matrices, state)
             except RuntimeError as error:
                 if str(error) != "oracle budget exhausted":
                     raise
                 break
-            state.explored_assignments += 1
-            last_activation, last_probability, last_cost = activation, probability, objective
-            if probability < state.threshold:
-                return self._result(
-                    state, activation, probability, True, "valid", objective,
-                    hard_clauses, global_weights, lane, started,
-                )
-            exact = self._exact_block_clause(local)
-            if exact not in hard_set:
-                hard_clauses.append(exact)
-                hard_set.add(exact)
+            for (activation, local, objective), probability in zip(pending, probabilities, strict=True):
+                state.explored_assignments += 1
+                state.candidate_evaluations += 1
+                last_activation, last_probability, last_cost = activation, probability, objective
+                if probability < state.threshold:
+                    logger.info(
+                        "valid candidate batch=%d/%d calls=%d cost=%s prob=%.4f",
+                        state.candidate_evaluations, state.explored_assignments,
+                        state.oracle_calls, objective, probability,
+                    )
+                    return self._result(
+                        state, activation, probability, True, "valid",
+                        objective, hard_clauses, global_weights, lane, started,
+                    )
                 state.exact_block_count += 1
-                state.exact_block_clauses.add(exact)
-            if lane == "expansion":
-                expansion = self._expansion_cut_clause(local)
-                if expansion is not None and expansion not in hard_set:
-                    hard_clauses.append(expansion)
-                    hard_set.add(expansion)
-                    state.expansion_cut_count += 1
-                    state.expansion_cut_clauses.add(expansion)
+                state.exact_block_clauses.add(self._exact_block_clause(local))
+                if lane == "expansion":
+                    expansion = self._expansion_cut_clause(local)
+                    if expansion is not None and expansion not in hard_set:
+                        hard_clauses.append(expansion)
+                        hard_set.add(expansion)
+                        state.expansion_cut_count += 1
+                        state.expansion_cut_clauses.add(expansion)
         return self._result(
             state, last_activation, last_probability, False, "oracle_budget_exhausted", last_cost,
             hard_clauses, global_weights, lane, started,

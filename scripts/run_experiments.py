@@ -7,6 +7,7 @@ import json
 import logging
 import shutil
 import sys
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -63,6 +64,8 @@ class ExperimentConfig:
     sensitivity_normalization: str
     minimum_lung_overlap: float
     hybrid_exact_budget_fraction: float
+    oracle_batch_size: int
+    per_sample_timeout_sec: float | None
     save_successful_examples: int
     classifier: str
     device: str
@@ -115,6 +118,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sensitivity-normalization", choices=("rank", "minmax"), default="rank")
     parser.add_argument("--minimum-lung-overlap", type=float, default=0.0)
     parser.add_argument("--hybrid-exact-budget-fraction", type=float, default=0.5)
+    parser.add_argument(
+        "--oracle-batch-size",
+        type=int,
+        default=16,
+        help="Number of CEGAR candidates evaluated per batched network inference",
+    )
+    parser.add_argument(
+        "--per-sample-timeout-sec",
+        type=float,
+        default=None,
+        help="Wall-clock deadline per image and occlusion method; None disables it",
+    )
     parser.add_argument(
         "--save-successful-examples",
         type=int,
@@ -329,6 +344,8 @@ def run(args: argparse.Namespace) -> Path:
         sensitivity_normalization=args.sensitivity_normalization,
         minimum_lung_overlap=args.minimum_lung_overlap,
         hybrid_exact_budget_fraction=args.hybrid_exact_budget_fraction,
+        oracle_batch_size=args.oracle_batch_size,
+        per_sample_timeout_sec=args.per_sample_timeout_sec,
         save_successful_examples=args.save_successful_examples,
         classifier=args.classifier,
         device=args.device,
@@ -408,7 +425,10 @@ def run(args: argparse.Namespace) -> Path:
                     sensitivity_normalization=args.sensitivity_normalization,
                     minimum_lung_overlap=args.minimum_lung_overlap,
                     hybrid_exact_budget_fraction=args.hybrid_exact_budget_fraction,
+                    oracle_batch_size=args.oracle_batch_size,
+                    timeout_seconds=args.per_sample_timeout_sec,
                 )
+                method_started = time.perf_counter()
                 solutions = explainer.diverse_solutions(
                     maximum_solutions=args.diverse_solutions,
                     repetition_penalty=args.repetition_penalty,
@@ -418,6 +438,21 @@ def run(args: argparse.Namespace) -> Path:
                     # Persist an invalid terminal trace instead of silently omitting it.
                     terminal = explainer.explain()
                     solutions = [terminal]
+                method_elapsed = time.perf_counter() - method_started
+                for solution in solutions:
+                    logging.info(
+                        "Method %s/%s done status=%s valid=%s calls=%d candidates=%d "
+                        "blocks=%d time=%.2fs oracle_time=%.2fs",
+                        image_id,
+                        method,
+                        solution.status,
+                        solution.valid,
+                        solution.oracle_calls,
+                        solution.candidate_evaluations,
+                        solution.exact_block_count,
+                        method_elapsed,
+                        solution.oracle_time_sec,
+                    )
                 diversity = mean_diversity_jaccard(solutions)
                 for solution_index, solution in enumerate(solutions):
                     record = evaluate_counterfactual(

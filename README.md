@@ -188,6 +188,13 @@ El presupuesto `--max-oracle-calls` debe ser al menos `M + 1`, donde `M` es el
 número de superpíxeles elegibles dentro del pulmón: una consulta para la RX original
 y una por cada singleton. El programa valida esta condición antes de iniciar RC2.
 
+Para mantener el benchmark de 154 radiografías dentro del límite de Kaggle, el
+solver agrupa candidatos CEGAR en una única pasada de red (`--oracle-batch-size`,
+por defecto 16) y puede acotar el tiempo por imagen/método con
+`--per-sample-timeout-sec` (opcional, sin límite por defecto). Cada método se
+termina siempre por presupuesto, insatisfacibilidad o deadline, y registra por log
+el estado, llamadas, candidatos evaluados, tiempo total y tiempo de red.
+
 ## Formulación y límites
 
 La variable `s_i` es verdadera cuando el superpíxel `i` se conserva. RC2 recibe la

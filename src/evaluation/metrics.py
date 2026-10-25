@@ -154,6 +154,8 @@ def evaluate_counterfactual(
         "expansion_cut_count": int(result.expansion_cut_count),
         "oracle_cache_hits": int(result.oracle_cache_hits),
         "oracle_cache_misses": int(result.oracle_cache_misses),
+        "oracle_time_sec": float(result.oracle_time_sec),
+        "candidate_evaluations": int(result.candidate_evaluations),
         "diversity_jaccard": float(diversity_jaccard),
         **pixel_metrics,
     }
